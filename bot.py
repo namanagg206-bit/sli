@@ -42,15 +42,21 @@ def save_data(data):
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="s!", intents=intents, help_command=None)
 tree = bot.tree
-# ─── OWNER LOCK — Username based ────────────────────────────────────────────
-OWNER_USERNAME = "YOUR_USERNAME"
+
+# ─── OWNER LOCK — Sirf is ID wala banda bot use kar sakta hai ────────────────
+OWNER_ID = 1370691518943330365   # Owner Discord ID
 
 @bot.check
 async def owner_only_global(ctx):
-    if ctx.author.name != wannabeminato
-        await ctx.send("❌ Yeh bot sirf owner ke liye hai.")
-        return False
-    return True
+    """Har prefix command ke pehle check hoga — sirf OWNER_ID wala use kar sakta hai."""
+    # Owner hamesha allowed hai
+    if ctx.author.id == OWNER_ID:
+        return True
+    # Setup command ke liye server admin bhi allowed (pehli baar config ke liye)
+    if ctx.command and ctx.command.name == "setup":
+        return ctx.author.guild_permissions.administrator
+    await ctx.send("❌ Yeh bot sirf server owner ke liye hai.")
+    return False
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def is_staff(member: discord.Member, data: dict) -> bool:
@@ -199,8 +205,7 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
-        await bot.process_commands(message)
-        return
+        return  # Bot messages pe commands process mat karo — infinite loop ka risk
 
     data = load_data()
     slot = data["slots"].get(str(message.channel.id))
@@ -1176,3 +1181,4 @@ if __name__ == "__main__":
         print("ERROR: Set the DISCORD_BOT_TOKEN environment variable.")
     else:
         bot.run(TOKEN)
+     
