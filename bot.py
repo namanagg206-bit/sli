@@ -1196,5 +1196,6 @@ if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: Set the DISCORD_BOT_TOKEN environment variable.")
     else:
+        keep_alive()
         bot.run(TOKEN)
      
