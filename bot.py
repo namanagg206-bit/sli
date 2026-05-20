@@ -43,6 +43,17 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="s!", intents=intents, help_command=None)
 tree = bot.tree
 
+# ─── OWNER LOCK — Sirf is ID wala banda bot use kar sakta hai ────────────────
+OWNER_ID = 123456789012345678   # <-- YAHAN APNA DISCORD USER ID DAALO
+
+@bot.check
+async def owner_only_global(ctx):
+    """Har prefix command ke pehle check hoga — sirf OWNER_ID wala use kar sakta hai."""
+    if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ Yeh bot sirf server owner ke liye hai.")
+        return False
+    return True
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def is_staff(member: discord.Member, data: dict) -> bool:
     staff_role_id = data.get("config", {}).get("staff_role_id")
@@ -170,7 +181,7 @@ async def reset_pings():
     data = load_data()
     for slot in data["slots"].values():
         if slot.get("status") == "active":
-            slot["pings_used"] = 0
+            slot["pings_used"] = 0   # Poori daily limit wapas milti hai (pings_allowed)
     save_data(data)
     logger.info("Daily ping reset complete.")
 
@@ -185,6 +196,33 @@ async def on_ready():
         name="🎰 Slots | s!help"
     ))
     logger.info(f"Bot online as {bot.user} | Guilds: {len(bot.guilds)}")
+
+# ─── Message guard: slot channel mein sirf owner message kar sakta hai ────────
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    data = load_data()
+    slot = data["slots"].get(str(message.channel.id))
+    if slot and slot.get("status") == "active":
+        owner_id = int(slot["user_id"])
+        # Agar sender owner nahi hai aur staff bhi nahi hai toh message delete karo
+        if message.author.id != owner_id and not is_staff(message.author, data):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            try:
+                await message.author.send(
+                    f"❌ Aap **{message.channel.name}** mein message nahi kar sakte. Yeh sirf slot owner ka channel hai."
+                )
+            except Exception:
+                pass
+            return
+
+    await bot.process_commands(message)
 
 # ════════════════════════════════════════════════════════════════════════════
 #  SETUP WIZARD
@@ -262,9 +300,10 @@ async def create_slot(ctx, member: discord.Member, duration: str, pings: int = N
     expires_at = datetime.utcnow() + td
 
     # Create channel
+    # default_role = view allowed but send_messages=False (sirf owner post kar sakta hai)
     guild = ctx.guild
     overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False),
         member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, attach_files=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
     }
@@ -1011,6 +1050,61 @@ async def redeem_code(ctx, code: str):
     await log_action(bot, data, "CODE REDEEMED", ctx.author, None, f"Code: {code}")
 
 # ════════════════════════════════════════════════════════════════════════════
+#  DESTROY — Slot channel ko poori tarah delete karo
+# ════════════════════════════════════════════════════════════════════════════
+@bot.command(name="destroy")
+async def destroy_slot(ctx, channel: discord.TextChannel = None):
+    """
+    s!destroy [#channel]
+    Channel nahi diya toh current channel delete hoga.
+    Slot data bhi saaf ho jaata hai.
+    """
+    data = load_data()
+    if not is_staff(ctx.author, data):
+        return await ctx.send("❌ Staff only.")
+
+    target = channel or ctx.channel
+    slot = data["slots"].get(str(target.id))
+
+    # Slot owner ko DM bhejo agar slot tha
+    if slot:
+        guild = ctx.guild
+        member = guild.get_member(int(slot["user_id"]))
+        slot_role_id = data["config"].get("slot_role_id")
+        if member:
+            if slot_role_id:
+                role = guild.get_role(int(slot_role_id))
+                if role and role in member.roles:
+                    await member.remove_roles(role)
+            try:
+                await member.send(embed=discord.Embed(
+                    title="💥 Slot Destroy Ho Gaya",
+                    description=f"Tumhara slot channel **{target.name}** ko `{ctx.author}` ne delete kar diya.",
+                    color=discord.Color.dark_red()
+                ))
+            except Exception:
+                pass
+        # Data mein se hataao
+        del data["slots"][str(target.id)]
+        save_data(data)
+
+    await log_action(bot, data, "SLOT DESTROYED", ctx.author, target, f"Channel: {target.name} permanently deleted")
+
+    try:
+        await target.delete(reason=f"Destroyed by {ctx.author}")
+    except Exception as e:
+        await ctx.send(f"❌ Channel delete nahi hua: {e}")
+        return
+
+    # Agar current channel tha toh wahan confirm nahi bhej sakte, log mein jayega
+    if target.id != ctx.channel.id:
+        await ctx.send(embed=discord.Embed(
+            title="💥 Slot Destroy",
+            description=f"`{target.name}` channel permanently delete kar diya gaya.",
+            color=discord.Color.dark_red()
+        ))
+
+# ════════════════════════════════════════════════════════════════════════════
 #  HELP COMMAND
 # ════════════════════════════════════════════════════════════════════════════
 @bot.command(name="help")
@@ -1051,6 +1145,7 @@ async def help_cmd(ctx):
         "`s!gencode <duration> [pings] [uses] [category]` — Staff\n"
         "`s!redeem <CODE>` — Redeem a slot code", inline=False)
     embed.add_field(name="🛠️ Utilities (Staff)", value=
+        "`s!destroy [#channel]` — Slot channel permanently delete karo\n"
         "`s!nuke` — Clear channel\n"
         "`s!announce #channel <message>`", inline=False)
     embed.add_field(name="⏱️ Duration Format", value="`7d` = 7 days | `1m` = 1 month | `2h` = 2 hours", inline=False)
