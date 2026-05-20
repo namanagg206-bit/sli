@@ -44,7 +44,7 @@ bot = commands.Bot(command_prefix="s!", intents=intents, help_command=None)
 tree = bot.tree
 
 # ─── OWNER LOCK — Sirf is ID wala banda bot use kar sakta hai ────────────────
-OWNER_ID = 123456789012345678   # <-- YAHAN APNA DISCORD USER ID DAALO
+OWNER_ID = 1370691518943330365   # <-- YAHAN APNA DISCORD USER ID DAALO
 
 @bot.check
 async def owner_only_global(ctx):
