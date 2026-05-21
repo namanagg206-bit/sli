@@ -9,22 +9,6 @@ import string
 from datetime import datetime, timedelta
 import logging
 
-from threading import Thread
-from flask import Flask
-
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot is alive!"
-
-def run_flask():
-    app.run(host="0.0.0.0", port=8080)
-
-def keep_alive():
-    t = Thread(target=run_flask)
-    t.daemon = True
-    t.start()
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -58,21 +42,6 @@ def save_data(data):
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="s!", intents=intents, help_command=None)
 tree = bot.tree
-
-# ─── OWNER LOCK — Sirf is ID wala banda bot use kar sakta hai ────────────────
-OWNER_ID = 1370691518943330365   # Owner Discord ID
-
-@bot.check
-async def owner_only_global(ctx):
-    """Har prefix command ke pehle check hoga — sirf OWNER_ID wala use kar sakta hai."""
-    # Owner hamesha allowed hai
-    if ctx.author.id == OWNER_ID:
-        return True
-    # Setup command ke liye server admin bhi allowed (pehli baar config ke liye)
-    if ctx.command and ctx.command.name == "setup":
-        return ctx.author.guild_permissions.administrator
-    await ctx.send("❌ Yeh bot sirf server owner ke liye hai.")
-    return False
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def is_staff(member: discord.Member, data: dict) -> bool:
@@ -201,7 +170,7 @@ async def reset_pings():
     data = load_data()
     for slot in data["slots"].values():
         if slot.get("status") == "active":
-            slot["pings_used"] = 0   # Poori daily limit wapas milti hai (pings_allowed)
+            slot["pings_used"] = 0
     save_data(data)
     logger.info("Daily ping reset complete.")
 
@@ -209,6 +178,10 @@ async def reset_pings():
 @bot.event
 async def on_ready():
     await tree.sync()
+    bot.add_view(TicketView())
+    bot.add_view(CloseTicketView())
+    bot.add_view(RecoveryView())
+    bot.add_view(SlotRequestView())
     auto_expire_slots.start()
     reset_pings.start()
     await bot.change_presence(activity=discord.Activity(
@@ -216,32 +189,6 @@ async def on_ready():
         name="🎰 Slots | s!help"
     ))
     logger.info(f"Bot online as {bot.user} | Guilds: {len(bot.guilds)}")
-
-# ─── Message guard: slot channel mein sirf owner message kar sakta hai ────────
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return  # Bot messages pe commands process mat karo — infinite loop ka risk
-
-    data = load_data()
-    slot = data["slots"].get(str(message.channel.id))
-    if slot and slot.get("status") == "active":
-        owner_id = int(slot["user_id"])
-        # Agar sender owner nahi hai aur staff bhi nahi hai toh message delete karo
-        if message.author.id != owner_id and not is_staff(message.author, data):
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            try:
-                await message.author.send(
-                    f"❌ Aap **{message.channel.name}** mein message nahi kar sakte. Yeh sirf slot owner ka channel hai."
-                )
-            except Exception:
-                pass
-            return
-
-    await bot.process_commands(message)
 
 # ════════════════════════════════════════════════════════════════════════════
 #  SETUP WIZARD
@@ -315,19 +262,30 @@ async def create_slot(ctx, member: discord.Member, duration: str, pings: int = N
     if not td:
         return await ctx.send("❌ Invalid duration. Use formats like `7d`, `1m`, `2h`.")
 
+    # Check if custom name provided via --name flag
+    custom_name = None
+    if "--name" in category:
+        parts = category.split("--name")
+        category = parts[0].strip() or "General"
+        custom_name = parts[1].strip().lower().replace(" ", "-") if len(parts) > 1 else None
+
     pings_allowed = pings if pings is not None else data["config"].get("default_pings", 10)
     expires_at = datetime.utcnow() + td
 
+    # Channel name: custom or default
+    channel_name = f"🎰・{custom_name}" if custom_name else f"🎰・{member.name.lower()}-slot"
+
     # Create channel
-    # default_role = view allowed but send_messages=False (sirf owner post kar sakta hai)
+    # default_role = view only (can see but NOT send messages)
+    # owner = can send messages
     guild = ctx.guild
     overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False),
-        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, attach_files=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, attach_files=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
     }
     slot_channel = await guild.create_text_channel(
-        name=f"🎰・{member.name.lower()}-slot",
+        name=channel_name,
         overwrites=overwrites,
         reason=f"Slot created for {member} by {ctx.author}"
     )
@@ -338,6 +296,9 @@ async def create_slot(ctx, member: discord.Member, duration: str, pings: int = N
         role = guild.get_role(int(slot_role_id))
         if role:
             await member.add_roles(role)
+
+    # Generate recovery key
+    recovery_key = "".join(random.choices(string.hexdigits.upper(), k=16))
 
     slot_entry = {
         "guild_id": str(guild.id),
@@ -352,7 +313,8 @@ async def create_slot(ctx, member: discord.Member, duration: str, pings: int = N
         "status": "active",
         "on_hold": False,
         "hold_reason": None,
-        "warnings": []
+        "warnings": [],
+        "recovery_key": recovery_key
     }
     data["slots"][str(slot_channel.id)] = slot_entry
     save_data(data)
@@ -370,15 +332,16 @@ async def create_slot(ctx, member: discord.Member, duration: str, pings: int = N
     welcome.set_footer(text="Use s!ping to ping | s!mystats for your stats")
     await slot_channel.send(member.mention, embed=welcome)
 
-    # DM the user
+    # DM the user with recovery key
     try:
         dm_embed = discord.Embed(
-            title="🎰 Slot Created!",
-            description=f"You've received a slot in **{guild.name}**!",
+            title="✅ Slot Recovery Key",
+            description=f"Your slot **{slot_channel.name}** has been created!\n\n**Your recovery key:** `{recovery_key}`\n\nSave this key safely for future use.",
             color=discord.Color.green()
         )
         dm_embed.add_field(name="Channel", value=slot_channel.mention)
         dm_embed.add_field(name="Expires", value=f"<t:{int(expires_at.timestamp())}:R>")
+        dm_embed.set_footer(text="Keep this key safe! Use it to recover slot access.")
         await member.send(embed=dm_embed)
     except Exception:
         pass
@@ -594,7 +557,6 @@ async def revoke_slot(ctx, channel: discord.TextChannel, *, reason: str = "No re
 #  PING MANAGEMENT
 # ════════════════════════════════════════════════════════════════════════════
 @bot.command(name="ping")
-@commands.cooldown(1, 3600, commands.BucketType.channel)
 async def use_ping(ctx):
     data = load_data()
     slot = data["slots"].get(str(ctx.channel.id))
@@ -607,14 +569,55 @@ async def use_ping(ctx):
     if slot.get("on_hold"):
         return await ctx.send("❌ Your slot is on hold.")
 
+    # ── Ping limit check ──
     if slot["pings_used"] >= slot["pings_allowed"]:
-        return await ctx.send(f"❌ No pings remaining. Resets in 24 hours.")
+        last_ping_time = datetime.fromisoformat(slot["last_ping"]) if slot.get("last_ping") else datetime.utcnow()
+        reset_at = last_ping_time + timedelta(hours=24)
+        embed = discord.Embed(
+            title="🚫 Ping Limit Reached!",
+            description=(
+                f"You have used all **{slot['pings_allowed']}/{slot['pings_allowed']}** pings for today.\n\n"
+                f"⏰ Resets <t:{int(reset_at.timestamp())}:R>"
+            ),
+            color=discord.Color.red()
+        )
+        embed.set_footer(text="Daily ping limit resets every 24 hours.")
+        return await ctx.send(embed=embed)
+
+    # ── Per-hour cooldown check ──
+    if slot.get("last_ping"):
+        last = datetime.fromisoformat(slot["last_ping"])
+        diff = (datetime.utcnow() - last).total_seconds()
+        if diff < 3600:
+            remaining_cd = int(3600 - diff)
+            mins = remaining_cd // 60
+            secs = remaining_cd % 60
+            return await ctx.send(embed=discord.Embed(
+                title="⏳ Cooldown!",
+                description=f"Wait **{mins}m {secs}s** before pinging again.",
+                color=discord.Color.orange()
+            ))
 
     slot["pings_used"] += 1
     slot["last_ping"] = datetime.utcnow().isoformat()
     save_data(data)
-    remaining = slot["pings_allowed"] - slot["pings_used"]
-    await ctx.send(f"📢 Ping used! **{remaining}** ping(s) remaining today.")
+    used = slot["pings_used"]
+    total = slot["pings_allowed"]
+    remaining = total - used
+
+    # Send @here ping
+    await ctx.send("@here")
+
+    # Ping count embed
+    ping_embed = discord.Embed(
+        title="📢 Ping Used!",
+        description=f"**Ping Count : {used}/{total}**",
+        color=discord.Color.blurple(),
+        timestamp=datetime.utcnow()
+    )
+    ping_embed.add_field(name="Remaining Today", value=f"**{remaining}** ping(s) left")
+    ping_embed.set_footer(text="Pings reset every 24 hours")
+    await ctx.send(embed=ping_embed)
 
 @bot.command(name="setpings")
 async def set_pings(ctx, channel: discord.TextChannel, amount: int):
@@ -1018,6 +1021,337 @@ async def ticket_panel(ctx, channel: discord.TextChannel = None):
     await ctx.send(f"✅ Ticket panel sent to {channel.mention}.")
 
 # ════════════════════════════════════════════════════════════════════════════
+#  SLOT REQUEST PANEL
+# ════════════════════════════════════════════════════════════════════════════
+class SlotRequestView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎰 Request Slot", style=discord.ButtonStyle.green, custom_id="request_slot")
+    async def request_slot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = SlotRequestModal()
+        await interaction.response.send_modal(modal)
+
+class SlotRequestModal(discord.ui.Modal, title="🎰 Slot Request"):
+    slot_name = discord.ui.TextInput(
+        label="Slot Channel Name",
+        placeholder="e.g. my-shop, gaming-deals, cheap-nitro",
+        min_length=2,
+        max_length=30
+    )
+    slot_info = discord.ui.TextInput(
+        label="What will you sell/advertise?",
+        placeholder="Brief description of your slot content...",
+        style=discord.TextStyle.paragraph,
+        min_length=5,
+        max_length=200
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = load_data()
+
+        # Check if user is blacklisted
+        if str(interaction.user.id) in data.get("blacklist", []):
+            return await interaction.response.send_message(
+                "❌ You are blacklisted from requesting slots.", ephemeral=True
+            )
+
+        # Check if user already has active slot
+        for slot in data["slots"].values():
+            if slot["user_id"] == str(interaction.user.id) and slot["status"] == "active":
+                return await interaction.response.send_message(
+                    "❌ You already have an active slot!", ephemeral=True
+                )
+
+        # Send request to staff approval channel
+        log_channel_id = data.get("config", {}).get("log_channel_id")
+        if not log_channel_id:
+            return await interaction.response.send_message(
+                "❌ Bot not configured yet. Contact staff.", ephemeral=True
+            )
+
+        log_channel = interaction.guild.get_channel(int(log_channel_id))
+        if not log_channel:
+            return await interaction.response.send_message(
+                "❌ Log channel not found. Contact staff.", ephemeral=True
+            )
+
+        clean_name = self.slot_name.value.strip().lower().replace(" ", "-")
+
+        embed = discord.Embed(
+            title="🎰 New Slot Request",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="👤 User", value=f"{interaction.user.mention} (`{interaction.user}`)", inline=True)
+        embed.add_field(name="📝 Channel Name", value=f"`🎰・{clean_name}`", inline=True)
+        embed.add_field(name="📋 Description", value=self.slot_info.value, inline=False)
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(text=f"User ID: {interaction.user.id}")
+
+        view = SlotApproveView(
+            user_id=str(interaction.user.id),
+            channel_name=clean_name
+        )
+        await log_channel.send(embed=embed, view=view)
+
+        await interaction.response.send_message(
+            "✅ Your slot request has been sent! Staff will review it shortly.",
+            ephemeral=True
+        )
+
+class SlotApproveView(discord.ui.View):
+    def __init__(self, user_id: str, channel_name: str):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.channel_name = channel_name
+
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green, custom_id="approve_slot_req")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        if not is_staff(interaction.user, data):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+
+        guild = interaction.guild
+        member = guild.get_member(int(self.user_id))
+        if not member:
+            return await interaction.response.send_message("❌ User not found in server.", ephemeral=True)
+
+        if str(member.id) in data.get("blacklist", []):
+            return await interaction.response.send_message("❌ User is blacklisted.", ephemeral=True)
+
+        pings_allowed = data["config"].get("default_pings", 10)
+        expires_at = datetime.utcnow() + timedelta(days=30)
+        channel_name = f"🎰・{self.channel_name}"
+
+        # Staff role overwrites
+        staff_role_id = data["config"].get("staff_role_id")
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+            member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, attach_files=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
+        }
+        if staff_role_id:
+            staff_role = guild.get_role(int(staff_role_id))
+            if staff_role:
+                overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+        slot_channel = await guild.create_text_channel(
+            name=channel_name,
+            overwrites=overwrites,
+            reason=f"Slot approved for {member} by {interaction.user}"
+        )
+
+        # Give slot role
+        slot_role_id = data["config"].get("slot_role_id")
+        if slot_role_id:
+            role = guild.get_role(int(slot_role_id))
+            if role:
+                await member.add_roles(role)
+
+        recovery_key = "".join(random.choices(string.hexdigits.upper(), k=16))
+
+        slot_entry = {
+            "guild_id": str(guild.id),
+            "channel_id": str(slot_channel.id),
+            "user_id": str(member.id),
+            "category": "Request",
+            "created_at": datetime.utcnow().isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "pings_allowed": pings_allowed,
+            "pings_used": 0,
+            "last_ping": None,
+            "status": "active",
+            "on_hold": False,
+            "hold_reason": None,
+            "warnings": [],
+            "recovery_key": recovery_key
+        }
+        data["slots"][str(slot_channel.id)] = slot_entry
+        save_data(data)
+
+        # Welcome message
+        welcome = discord.Embed(
+            title="🎰 Your Slot is Ready!",
+            description=f"Welcome {member.mention}! This is your personal slot channel.\n\n⚠️ Only you and staff can send messages here.",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        welcome.add_field(name="⏳ Expires", value=f"<t:{int(expires_at.timestamp())}:F>")
+        welcome.add_field(name="🔔 Pings Allowed", value=str(pings_allowed))
+        welcome.set_footer(text="Use s!ping to ping members")
+        await slot_channel.send(member.mention, embed=welcome)
+
+        # DM recovery key
+        try:
+            dm_embed = discord.Embed(
+                title="✅ Slot Approved!",
+                description=f"Your slot request was approved!\n\n**Recovery Key:** `{recovery_key}`\n\nSave this key safely!",
+                color=discord.Color.green()
+            )
+            dm_embed.add_field(name="Channel", value=slot_channel.mention)
+            dm_embed.add_field(name="Expires", value=f"<t:{int(expires_at.timestamp())}:R>")
+            await member.send(embed=dm_embed)
+        except Exception:
+            pass
+
+        # Update approval message
+        approved_embed = discord.Embed(
+            title="✅ Slot Request Approved",
+            description=f"{member.mention}'s slot has been created: {slot_channel.mention}",
+            color=discord.Color.green()
+        )
+        await interaction.response.edit_message(embed=approved_embed, view=None)
+
+    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.red, custom_id="deny_slot_req")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        if not is_staff(interaction.user, data):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+
+        guild = interaction.guild
+        member = guild.get_member(int(self.user_id))
+
+        if member:
+            try:
+                await member.send(embed=discord.Embed(
+                    title="❌ Slot Request Denied",
+                    description=f"Your slot request in **{guild.name}** was denied by staff.",
+                    color=discord.Color.red()
+                ))
+            except Exception:
+                pass
+
+        denied_embed = discord.Embed(
+            title="❌ Slot Request Denied",
+            description=f"{member.mention if member else 'User'}'s slot request was denied by {interaction.user.mention}",
+            color=discord.Color.red()
+        )
+        await interaction.response.edit_message(embed=denied_embed, view=None)
+
+@bot.command(name="slotpanel")
+async def slot_panel(ctx, channel: discord.TextChannel = None):
+    data = load_data()
+    if not is_staff(ctx.author, data):
+        return await ctx.send("❌ Staff only.")
+    channel = channel or ctx.channel
+    embed = discord.Embed(
+        title="🎰 Request a Slot",
+        description=(
+            "Want your own slot channel? Click the button below!\n\n"
+            "**Rules:**\n"
+            "• Only you and staff can send messages in your slot\n"
+            "• Follow server rules\n"
+            "• Staff will review your request"
+        ),
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=ctx.guild.name)
+    await channel.send(embed=embed, view=SlotRequestView())
+    await ctx.send(f"✅ Slot request panel sent to {channel.mention}.")
+
+# ════════════════════════════════════════════════════════════════════════════
+#  RECOVERY PANEL
+# ════════════════════════════════════════════════════════════════════════════
+class RecoveryView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔑 Recover Slot", style=discord.ButtonStyle.primary, custom_id="recover_slot")
+    async def recover_slot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Ask for recovery key via modal
+        modal = RecoveryModal()
+        await interaction.response.send_modal(modal)
+
+class RecoveryModal(discord.ui.Modal, title="🔑 Slot Recovery"):
+    recovery_key = discord.ui.TextInput(
+        label="Enter Your Recovery Key",
+        placeholder="e.g. 94CC1114EFFA53FF",
+        min_length=16,
+        max_length=16
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = load_data()
+        entered_key = self.recovery_key.value.upper().strip()
+
+        # Find slot with this recovery key
+        found_slot = None
+        found_ch_id = None
+        for ch_id, slot in data["slots"].items():
+            if slot.get("recovery_key") == entered_key:
+                found_slot = slot
+                found_ch_id = ch_id
+                break
+
+        if not found_slot:
+            return await interaction.response.send_message(
+                "❌ Invalid recovery key. Please check and try again.", ephemeral=True
+            )
+
+        if found_slot["status"] != "active":
+            return await interaction.response.send_message(
+                "❌ This slot is no longer active.", ephemeral=True
+            )
+
+        guild = interaction.guild
+        channel = guild.get_channel(int(found_ch_id))
+
+        if not channel:
+            return await interaction.response.send_message(
+                "❌ Slot channel not found. Contact staff.", ephemeral=True
+            )
+
+        # Restore access
+        await channel.set_permissions(
+            interaction.user,
+            view_channel=True,
+            send_messages=True,
+            embed_links=True,
+            attach_files=True
+        )
+
+        # Update owner if different
+        old_user_id = found_slot["user_id"]
+        found_slot["user_id"] = str(interaction.user.id)
+
+        # Generate new recovery key
+        new_key = "".join(random.choices(string.hexdigits.upper(), k=16))
+        found_slot["recovery_key"] = new_key
+        save_data(data)
+
+        # DM new recovery key
+        try:
+            dm_embed = discord.Embed(
+                title="✅ Slot Recovered",
+                description=f"Your slot has been recovered successfully!\n\n**Your new recovery key:** `{new_key}`\n\nSave this key safely for future use.",
+                color=discord.Color.green()
+            )
+            await interaction.user.send(embed=dm_embed)
+        except Exception:
+            pass
+
+        await interaction.response.send_message(
+            f"✅ Slot recovered! Check {channel.mention} — new recovery key sent to your DMs.",
+            ephemeral=True
+        )
+
+@bot.command(name="recoverypanel")
+async def recovery_panel(ctx, channel: discord.TextChannel = None):
+    data = load_data()
+    if not is_staff(ctx.author, data):
+        return await ctx.send("❌ Staff only.")
+    channel = channel or ctx.channel
+    embed = discord.Embed(
+        title="Recovery Panel",
+        description="Use the button below to recover your slot access.\n\n**Recover Slot**\nUse the restore button to restore your previous slot if you've lost access to it.",
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text=ctx.guild.name)
+    await channel.send(embed=embed, view=RecoveryView())
+    await ctx.send(f"✅ Recovery panel sent to {channel.mention}.")
+
+# ════════════════════════════════════════════════════════════════════════════
 #  REDEEM CODES
 # ════════════════════════════════════════════════════════════════════════════
 @bot.command(name="gencode")
@@ -1069,61 +1403,6 @@ async def redeem_code(ctx, code: str):
     await log_action(bot, data, "CODE REDEEMED", ctx.author, None, f"Code: {code}")
 
 # ════════════════════════════════════════════════════════════════════════════
-#  DESTROY — Slot channel ko poori tarah delete karo
-# ════════════════════════════════════════════════════════════════════════════
-@bot.command(name="destroy")
-async def destroy_slot(ctx, channel: discord.TextChannel = None):
-    """
-    s!destroy [#channel]
-    Channel nahi diya toh current channel delete hoga.
-    Slot data bhi saaf ho jaata hai.
-    """
-    data = load_data()
-    if not is_staff(ctx.author, data):
-        return await ctx.send("❌ Staff only.")
-
-    target = channel or ctx.channel
-    slot = data["slots"].get(str(target.id))
-
-    # Slot owner ko DM bhejo agar slot tha
-    if slot:
-        guild = ctx.guild
-        member = guild.get_member(int(slot["user_id"]))
-        slot_role_id = data["config"].get("slot_role_id")
-        if member:
-            if slot_role_id:
-                role = guild.get_role(int(slot_role_id))
-                if role and role in member.roles:
-                    await member.remove_roles(role)
-            try:
-                await member.send(embed=discord.Embed(
-                    title="💥 Slot Destroy Ho Gaya",
-                    description=f"Tumhara slot channel **{target.name}** ko `{ctx.author}` ne delete kar diya.",
-                    color=discord.Color.dark_red()
-                ))
-            except Exception:
-                pass
-        # Data mein se hataao
-        del data["slots"][str(target.id)]
-        save_data(data)
-
-    await log_action(bot, data, "SLOT DESTROYED", ctx.author, target, f"Channel: {target.name} permanently deleted")
-
-    try:
-        await target.delete(reason=f"Destroyed by {ctx.author}")
-    except Exception as e:
-        await ctx.send(f"❌ Channel delete nahi hua: {e}")
-        return
-
-    # Agar current channel tha toh wahan confirm nahi bhej sakte, log mein jayega
-    if target.id != ctx.channel.id:
-        await ctx.send(embed=discord.Embed(
-            title="💥 Slot Destroy",
-            description=f"`{target.name}` channel permanently delete kar diya gaya.",
-            color=discord.Color.dark_red()
-        ))
-
-# ════════════════════════════════════════════════════════════════════════════
 #  HELP COMMAND
 # ════════════════════════════════════════════════════════════════════════════
 @bot.command(name="help")
@@ -1164,7 +1443,6 @@ async def help_cmd(ctx):
         "`s!gencode <duration> [pings] [uses] [category]` — Staff\n"
         "`s!redeem <CODE>` — Redeem a slot code", inline=False)
     embed.add_field(name="🛠️ Utilities (Staff)", value=
-        "`s!destroy [#channel]` — Slot channel permanently delete karo\n"
         "`s!nuke` — Clear channel\n"
         "`s!announce #channel <message>`", inline=False)
     embed.add_field(name="⏱️ Duration Format", value="`7d` = 7 days | `1m` = 1 month | `2h` = 2 hours", inline=False)
@@ -1196,6 +1474,4 @@ if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: Set the DISCORD_BOT_TOKEN environment variable.")
     else:
-        keep_alive()
         bot.run(TOKEN)
-     
