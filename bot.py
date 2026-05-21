@@ -329,7 +329,13 @@ async def create_slot(ctx, member: discord.Member, duration: str, pings: int = N
     welcome.add_field(name="⏳ Expires", value=f"<t:{int(expires_at.timestamp())}:F>")
     welcome.add_field(name="🔔 Pings Allowed", value=str(pings_allowed))
     welcome.add_field(name="📂 Category", value=category)
-    welcome.set_footer(text="Use s!ping to ping | s!mystats for your stats")
+    welcome.add_field(
+    name="⚠️ Important",
+    value='Use "s!snipe" for pings.\nDirect pings or "@everyone" may result in a ban.',
+    inline=False
+)
+
+welcome.set_footer(text="Use s!ping to ping | s!mystats for your stats")
     await slot_channel.send(member.mention, embed=welcome)
 
     # DM the user with recovery key
