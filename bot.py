@@ -569,9 +569,7 @@ async def use_ping(ctx):
     if not slot:
         return await ctx.send("❌ This is not a slot channel.")
 
-    if slot["user_id"] != str(ctx.author.id) and not is_staff(ctx.author, data):
-        return await ctx.send("❌ Only the slot owner can use pings.")
-
+    
     if slot.get("on_hold"):
         return await ctx.send("❌ Your slot is on hold.")
 
